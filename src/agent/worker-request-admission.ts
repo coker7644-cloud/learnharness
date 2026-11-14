@@ -126,7 +126,9 @@ class WorkerRequestStream extends AssistantMessageEventStream {
 		super.end(message);
 	}
 	private stopSource(): void {
-		this.controller.abort();
+		if (!this.final || this.final.stopReason === "error" || this.final.stopReason === "aborted") {
+			this.controller.abort();
+		}
 		// Signal/end are the native cancellation contract: wake SDK waits and
 		// discard subsequent pushes. Our own waits are bounded independently;
 		// an uncooperative custom provider's actual network cannot be forced shut.

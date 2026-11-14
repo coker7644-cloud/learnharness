@@ -48,10 +48,43 @@ async function getMcpClient() {
 	return mcpClientPromise;
 }
 
-async function callMcpTool(toolName, args) {
+async function callMcpTool(toolName, args, signal) {
 	const client = await getMcpClient();
-	const result = await client.callTool({ name: toolName, arguments: args });
+	const result = await client.callTool({ name: toolName, arguments: args }, undefined, signal ? { signal } : undefined);
 	return result.content?.map((c) => c.text).join("\n") ?? JSON.stringify(result);
+}
+
+async function openRawMcpSession() {
+	const baseHeaders = {
+		...mcpHeaders,
+		"Content-Type": "application/json",
+		Accept: "application/json, text/event-stream",
+	};
+	const initRes = await fetch(mcpUrl, {
+		method: "POST",
+		headers: baseHeaders,
+		body: JSON.stringify({
+			jsonrpc: "2.0",
+			id: 1,
+			method: "initialize",
+			params: { protocolVersion: "2025-03-26", capabilities: {}, clientInfo: { name: "fake-agy-raw", version: "1.0.0" } },
+		}),
+	});
+	const mcpSessionId = initRes.headers.get("mcp-session-id") ?? "";
+	const sessionHeaders = { ...baseHeaders, "mcp-session-id": mcpSessionId };
+	await fetch(mcpUrl, {
+		method: "POST",
+		headers: sessionHeaders,
+		body: JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" }),
+	});
+	return sessionHeaders;
+}
+
+const ipcWaiters = new Map();
+function waitForIpc(expected) {
+	return new Promise((resolve) => {
+		ipcWaiters.set(expected, resolve);
+	});
 }
 
 process.on("message", (msg) => {
@@ -59,12 +92,22 @@ process.on("message", (msg) => {
 		const release = waitRelease;
 		waitRelease = null;
 		release();
+		return;
+	}
+	const waiter = ipcWaiters.get(msg);
+	if (waiter) {
+		ipcWaiters.delete(msg);
+		waiter();
 	}
 });
 
 async function handlePrompt(rpcId) {
-	if (scenario.window) {
-		sendUpdate({ sessionUpdate: "usage_update", size: scenario.window });
+	if (scenario.window || scenario.used) {
+		sendUpdate({
+			sessionUpdate: "usage_update",
+			...(scenario.window ? { size: scenario.window } : {}),
+			...(scenario.used ? { used: scenario.used } : {}),
+		});
 	}
 	if (scenario.checkpointWait) {
 		process.send?.("checkpoint");
@@ -78,6 +121,9 @@ async function handlePrompt(rpcId) {
 	}
 	const results = [];
 	for (const step of scenario.calls ?? []) {
+		if (step.used) {
+			sendUpdate({ sessionUpdate: "usage_update", used: step.used });
+		}
 		if (step.kind === "builtin_denied") {
 			const perm = await requestFromHost("session/request_permission", {
 				sessionId,
@@ -102,6 +148,42 @@ async function handlePrompt(rpcId) {
 			});
 			if (perm.outcome?.optionId !== "allow") {
 				throw new Error(`Permission rejected for ${mcpName}`);
+			}
+			if (step.preMcpFail) {
+				sendUpdate({ sessionUpdate: "tool_call_update", toolCallId: step.id, status: "failed" });
+				results.push({ id: step.id, text: "pre-mcp-failed" });
+				continue;
+			}
+			if (step.waitAction === "timeout") {
+				const ac = new AbortController();
+				const pending = callMcpTool(step.tool, step.arguments ?? {}, ac.signal);
+				await waitForIpc("timeout");
+				ac.abort("timeout");
+				await pending.catch(() => {});
+				sendUpdate({ sessionUpdate: "tool_call_update", toolCallId: step.id, status: "failed" });
+				results.push({ id: step.id, text: "mcp-timeout" });
+				continue;
+			}
+			if (step.waitAction === "dropHttp") {
+				const sessionHeaders = await openRawMcpSession();
+				const ac = new AbortController();
+				const pending = fetch(mcpUrl, {
+					method: "POST",
+					headers: sessionHeaders,
+					signal: ac.signal,
+					body: JSON.stringify({ jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: step.tool, arguments: step.arguments ?? {} } }),
+				});
+				await waitForIpc("dropHttp");
+				ac.abort("dropHttp");
+				await pending.catch(() => {});
+				results.push({ id: step.id, text: "http-dropped" });
+				continue;
+			}
+			if (step.waitAction === "abandon") {
+				void callMcpTool(step.tool, step.arguments ?? {}).catch(() => {});
+				await waitForIpc("abandon");
+				results.push({ id: step.id, text: "abandoned-wait" });
+				continue;
 			}
 			const text = await callMcpTool(step.tool, step.arguments ?? {});
 			results.push({ id: step.id, text });

@@ -17,8 +17,10 @@ import { setTimeout as sleep } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 import test, { after, type TestContext } from "node:test";
 
+import { normalizeContext } from "@earendil-works/pi-ai";
 import type { RunAgy } from "../src/agent/agy/stream.ts";
 import type { PiEngine } from "../src/agent/models.ts";
+import { workerRequestStream } from "../src/agent/worker-request-admission.ts";
 
 const testData = mkdtempSync(join(tmpdir(), "lh-agy-harness-data-"));
 process.env.LH_DATA_DIR = testData;
@@ -30,6 +32,7 @@ const { LIVE_PROCESS_IDLE_TIMEOUT_MS, liveProcessIdleTimeoutMs } = await import(
 const { AGY_MODELS } = await import("../src/agent/agy/provider.ts");
 const { createAgyStreamFunction } = await import("../src/agent/agy/stream.ts");
 const { createTeacherAgent } = await import("../src/agent/teacher-agent.ts");
+const { measuredContextTokens } = await import("../src/core/context-usage.ts");
 const { cliContextWindowOf, danglingQuestionOf } = await import("../src/core/native-messages.ts");
 const { handleChatRequest } = await import("../src/server/chat-handler.ts");
 const { isTurnRunning } = await import("../src/server/turn-liveness.ts");
@@ -45,11 +48,23 @@ const ANSWER_TEXT = "SYN, SYN-ACK, ACK";
 
 type FakeScenario = {
 	window?: number;
+	used?: number;
 	checkpointWait?: boolean;
 	thought?: string;
 	text?: string;
 	afterText?: string;
-	calls?: Array<{ kind: "mcp"; id: string; tool: string; arguments?: Record<string, unknown> } | { kind: "builtin_denied"; id: string; name: string }>;
+	calls?: Array<
+		| {
+			kind: "mcp";
+			id: string;
+			tool: string;
+			arguments?: Record<string, unknown>;
+			used?: number;
+			preMcpFail?: boolean;
+			waitAction?: "timeout" | "dropHttp" | "abandon";
+		}
+		| { kind: "builtin_denied"; id: string; name: string; used?: number }
+	>;
 };
 
 type FakeRun = { runAgy: RunAgy; children: ChildProcessWithoutNullStreams[]; stdinFiles: string[] };
@@ -279,3 +294,129 @@ test("an expired idle timeout replays the answered turn onto a fresh agy process
 	assert.equal(getLastAssistantText(chatId), `Replayed answer: ${ANSWER_TEXT}`);
 	await waitForExit(fakeRun.children[1]!);
 });
+
+test("toolUse turns report usage_update.used as measured context tokens and recover from pre-MCP failed tool_call_update", async (t) => {
+	const fakeRun = createFakeRun(t, [{
+		window: 1048576,
+		used: 8969,
+		calls: [
+			{ kind: "mcp", id: "failed_call_1", tool: "ask_user_question", arguments: { question: "ignored" }, preMcpFail: true },
+			{ kind: "mcp", id: ASK_ID, tool: "ask_user_question", arguments: { question: ASK_QUESTION }, used: 9321 },
+		],
+		afterText: "Recovered:",
+	}]);
+	const agentFactory = createAgentFactory(fakeRun);
+	const chatId = createAgyChat(t);
+
+	await runChatTurn(chatId, { type: "text", text: "teach me TCP" }, agentFactory);
+
+	const messages = chatStore.getChat(chatId)?.messages ?? [];
+	assert.equal(danglingQuestionOf(messages)?.toolCallId, ASK_ID);
+	assert.equal(measuredContextTokens(messages), 9321);
+	assert.deepEqual(cliContextWindowOf(messages), { model: "agy:gemini-4-hydrogen", tokens: 1048576 });
+
+	await runChatTurn(chatId, toAnswerInput(), agentFactory);
+	assert.equal(fakeRun.children.length, 1);
+	assert.ok(getLastAssistantText(chatId).includes(ANSWER_TEXT));
+	await waitForExit(fakeRun.children[0]!);
+});
+
+test("workerRequestStream reuses live agy ACP process across toolUse iterations", async (t) => {
+	const fakeRun = createFakeRun(t, [{
+		window: 1048576,
+		used: 4200,
+		calls: [{ kind: "mcp", id: "call_pdf_1", tool: "pdf_info", arguments: {} }],
+		afterText: "Brief ready:",
+	}]);
+	const model = AGY_MODELS.find((candidate) => candidate.id === "gemini-4-hydrogen");
+	assert.ok(model);
+	const wrappedStream = workerRequestStream(createAgyStreamFunction(fakeRun.runAgy));
+	const tools = [{ name: "pdf_info", description: "triage", parameters: { type: "object", properties: {} } as never }];
+	const sessionId = "worker-reuse-session";
+
+	const firstMessages = [{ role: "user" as const, content: "Read PDF", timestamp: Date.now() }];
+	const firstRes = await wrappedStream(model, normalizeContext({ systemPrompt: "PDF reader", messages: firstMessages, tools }), { sessionId }).result();
+	assert.equal(firstRes.stopReason, "toolUse");
+	assert.equal(firstRes.usage.input, 4200);
+	assert.equal(fakeRun.children.length, 1);
+	assert.equal(fakeRun.children[0]!.exitCode, null, "clean toolUse completion must not abort live agy process");
+
+	const nextMessages = [
+		...firstMessages,
+		firstRes,
+		{ role: "toolResult" as const, toolCallId: "call_pdf_1", toolName: "pdf_info", content: [{ type: "text" as const, text: "Pages: 14" }], isError: false, timestamp: Date.now() },
+	];
+	const secondRes = await wrappedStream(model, normalizeContext({ systemPrompt: "PDF reader", messages: nextMessages, tools }), { sessionId }).result();
+	assert.equal(secondRes.stopReason, "stop");
+	assert.equal(fakeRun.children.length, 1, "subsequent worker iteration must reuse the live agy process");
+	assert.ok(secondRes.content.some((b) => b.type === "text" && b.text.includes("Pages: 14")));
+	await waitForExit(fakeRun.children[0]!);
+});
+
+test("an MCP call timeout while waiting for a learner answer retires cleanly and replays onto a fresh agy process", async (t) => {
+	const fakeRun = createFakeRun(t, [
+		{
+			calls: [{ kind: "mcp", id: ASK_ID, tool: "ask_user_question", arguments: { question: ASK_QUESTION }, waitAction: "timeout" }],
+			afterText: "CLI timed out wait:",
+		},
+		{ text: `Recovered after MCP timeout: ${ANSWER_TEXT}` },
+	]);
+	const factory = createAgentFactory(fakeRun);
+	const chatId = createAgyChat(t);
+
+	await runChatTurn(chatId, { type: "text", text: "teach me TCP" }, factory);
+	assert.equal(danglingQuestionOf(chatStore.getChat(chatId)?.messages ?? [])?.toolCallId, ASK_ID);
+	fakeRun.children[0]!.send("timeout");
+	await waitForExit(fakeRun.children[0]!);
+
+	await runChatTurn(chatId, toAnswerInput(), factory);
+	assert.equal(fakeRun.children.length, 2);
+	assert.equal(getLastAssistantText(chatId), `Recovered after MCP timeout: ${ANSWER_TEXT}`);
+	await waitForExit(fakeRun.children[1]!);
+});
+
+test("dropping the held MCP HTTP response without notifications/cancelled still retires cleanly for replay", async (t) => {
+	const fakeRun = createFakeRun(t, [
+		{
+			calls: [{ kind: "mcp", id: ASK_ID, tool: "ask_user_question", arguments: { question: ASK_QUESTION }, waitAction: "dropHttp" }],
+			afterText: "CLI dropped wait:",
+		},
+		{ text: `Recovered after HTTP drop: ${ANSWER_TEXT}` },
+	]);
+	const factory = createAgentFactory(fakeRun);
+	const chatId = createAgyChat(t);
+
+	await runChatTurn(chatId, { type: "text", text: "teach me TCP" }, factory);
+	assert.equal(danglingQuestionOf(chatStore.getChat(chatId)?.messages ?? [])?.toolCallId, ASK_ID);
+	fakeRun.children[0]!.send("dropHttp");
+	await waitForExit(fakeRun.children[0]!);
+
+	await runChatTurn(chatId, toAnswerInput(), factory);
+	assert.equal(fakeRun.children.length, 2);
+	assert.equal(getLastAssistantText(chatId), `Recovered after HTTP drop: ${ANSWER_TEXT}`);
+	await waitForExit(fakeRun.children[1]!);
+});
+
+test("moving on while the held MCP call is still open still fails continuation", async (t) => {
+	const fakeRun = createFakeRun(t, [
+		{
+			calls: [{ kind: "mcp", id: ASK_ID, tool: "ask_user_question", arguments: { question: ASK_QUESTION }, waitAction: "abandon" }],
+			afterText: "CLI moved on unexpectedly:",
+		},
+	]);
+	const factory = createAgentFactory(fakeRun);
+	const chatId = createAgyChat(t);
+
+	await runChatTurn(chatId, { type: "text", text: "teach me TCP" }, factory);
+	assert.equal(danglingQuestionOf(chatStore.getChat(chatId)?.messages ?? [])?.toolCallId, ASK_ID);
+	fakeRun.children[0]!.send("abandon");
+	await waitForExit(fakeRun.children[0]!);
+
+	await runChatTurn(chatId, toAnswerInput(), factory);
+	assert.equal(fakeRun.children.length, 1);
+	const last = chatStore.getChat(chatId)?.messages.at(-1);
+	assert.equal(last?.role, "assistant");
+	assert.equal(last.stopReason, "error");
+	assert.match(last.errorMessage ?? "", /moved on while harness tool calls were waiting for results/);
+});
+

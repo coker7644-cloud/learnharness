@@ -97,7 +97,9 @@ export class Sheets {
   }
   update(state: SessionSheet, strokes: Stroke[]): void {
     if (!state.draft) return;
-    state.draft = { ...state.draft, revision: state.draft.revision + 1, strokes, hasInk: visibleStrokes(strokes).length > 0 };
+    const last = strokes.at(-1);
+    const hasInk = last?.tool === "pen" && last.points.length > 0 ? true : visibleStrokes(strokes).length > 0;
+    state.draft = { ...state.draft, revision: state.draft.revision + 1, strokes, hasInk };
     this.publish();
   }
   setTool(state: SessionSheet, tool: Tool): void { state.tool = tool; this.publish(); }
@@ -119,8 +121,10 @@ export class Sheets {
     return signature;
   }
   pending(state: SessionSheet): boolean {
-    const signature = this.signature(state);
-    return !!signature && (state.kind === "teaching" || signature !== state.sentSignature);
+    const draft = state.draft;
+    if (!draft?.hasInk) return false;
+    if (state.kind === "teaching" || !state.sentSignature) return true;
+    return this.signature(state) !== state.sentSignature;
   }
   capture(state: SessionSheet): Capture | undefined {
     const draft = state.draft;

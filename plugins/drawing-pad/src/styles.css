@@ -8,8 +8,8 @@
   min-height: 48px; padding: 8px 12px; overflow-x: auto; pointer-events: none;
 }
 .drawing-pad-tools > span { flex: 0 0 auto; pointer-events: auto; }
-.drawing-pad-viewport { position: absolute; inset: 0; min-width: 0; min-height: 0; overflow: hidden; }
-.drawing-pad-paper { position: absolute; inset: 0; overflow: hidden; }
+.drawing-pad-viewport { position: absolute; inset: 0; min-width: 0; min-height: 0; overflow: hidden; touch-action: none; }
+.drawing-pad-paper { position: absolute; inset: 0; overflow: hidden; touch-action: none; }
 .drawing-pad-background { position: absolute; max-width: none; max-height: none; pointer-events: none; user-select: none; }
 .drawing-pad-background[hidden] { display: none; }
 .drawing-pad-ink { position: absolute; inset: 0; width: 100%; height: 100%; touch-action: none; user-select: none; cursor: default; }

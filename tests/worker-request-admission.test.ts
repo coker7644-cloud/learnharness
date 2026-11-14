@@ -307,8 +307,10 @@ test("abort listeners are removed after successful completion", async () => {
 	const f = fixture(), stream = f.call(controller.signal), result = stream.result();
 	await tick(); finish(f.sources[0]!); await result;
 	assert.equal(added, 1); assert.equal(removed, 1);
+	assert.equal(f.signals[0]?.aborted, false);
 	controller.abort();
 	assert.equal((await stream.result()).stopReason, "stop");
+	assert.equal(f.signals[0]?.aborted, false);
 });
 
 test("duplicated modules share the same pool/configuration and wrapper metadata", async () => {

@@ -25,11 +25,29 @@ export async function activate(ctx: PluginFrontendContext): Promise<() => void> 
   // Opaque public path strings are associated ONLY on an actual contextual click.
   // No route parsing or global-current-session inference is used for targeting.
   const pageSessions = new Map<string, string>();
+  let lastHostKey = "";
+  const hostStateKey = () => {
+    const entries: unknown[] = [];
+    for (const state of sheets.sessions.values()) {
+      entries.push([state.id, Boolean(state.draft), sheets.pending(state), Boolean(state.draft?.strokes.length), state.seenPoses.size]);
+    }
+    return JSON.stringify(entries);
+  };
   const sheets = new Sheets(() => {
     if (!disposed && !ctx.signal.aborted) {
-      ctx.refreshActions(); ctx.refreshSubmissions();
-      if (current && [...sheets.sessions.values()].some(state => state.draft && state.draft.palette !== appPalette().key))
-        void refreshPalette().catch(report);
+      const nextHostKey = hostStateKey();
+      if (nextHostKey !== lastHostKey) {
+        lastHostKey = nextHostKey;
+        ctx.refreshActions(); ctx.refreshSubmissions();
+      }
+      if (current) {
+        let paletteKey: string | undefined;
+        for (const state of sheets.sessions.values()) {
+          if (!state.draft) continue;
+          paletteKey ??= appPalette().key;
+          if (state.draft.palette !== paletteKey) { void refreshPalette().catch(report); break; }
+        }
+      }
     }
   }, state => { if (open?.session === state) close(open); }, activeInk);
   function close(pad: OpenPad): void {

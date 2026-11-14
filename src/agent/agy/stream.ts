@@ -124,6 +124,7 @@ function nonNegInt(value: unknown): number {
 class AgyTurn {
 	private readonly output: AssistantMessage & Pick<LhMessage, "cliContextWindow">;
 	private activeBlock: { kind: "text" | "thinking"; contentIndex: number } | null = null;
+	private usedTokens: number | undefined;
 	started = false;
 	finished = false;
 
@@ -185,10 +186,17 @@ class AgyTurn {
 		}
 	}
 
+	setUsedTokens(tokens: number | undefined): void {
+		if (!this.finished && tokens !== undefined && Number.isSafeInteger(tokens) && tokens > 0) {
+			this.usedTokens = tokens;
+		}
+	}
+
 	admit(calls: ToolCall[]): void {
 		if (this.finished) return;
 		this.start();
 		this.closeOpenBlock();
+		this.applyUsedFallback();
 		for (const call of calls) {
 			const contentIndex = this.output.content.length;
 			this.output.content.push(call);
@@ -211,14 +219,21 @@ class AgyTurn {
 			const cacheRead = nonNegInt(usage.cachedReadTokens);
 			const cacheWrite = nonNegInt(usage.cachedWriteTokens);
 			const reasoning = nonNegInt(usage.thoughtTokens);
-			Object.assign(this.output.usage, {
-				input,
-				output,
-				cacheRead,
-				cacheWrite,
-				reasoning,
-				totalTokens: input + output + cacheRead + cacheWrite,
-			});
+			const totalTokens = input + output + cacheRead + cacheWrite;
+			if (totalTokens > 0) {
+				Object.assign(this.output.usage, {
+					input,
+					output,
+					cacheRead,
+					cacheWrite,
+					reasoning,
+					totalTokens,
+				});
+			} else {
+				this.applyUsedFallback();
+			}
+		} else {
+			this.applyUsedFallback();
 		}
 
 		if (stopReason === "cancelled") {
@@ -262,6 +277,17 @@ class AgyTurn {
 
 		this.started = true;
 		this.stream.push({ type: "start", partial: this.output });
+	}
+
+	private applyUsedFallback(): void {
+		if (this.usedTokens === undefined || this.usedTokens <= 0) return;
+		Object.assign(this.output.usage, {
+			input: this.usedTokens,
+			output: 0,
+			cacheRead: 0,
+			cacheWrite: 0,
+			totalTokens: this.usedTokens,
+		});
 	}
 }
 
@@ -319,6 +345,7 @@ class AgyProcess implements LiveProcess {
 	private admitted: PendingToolCall[] = [];
 	private pendingError: string | undefined;
 	private contextWindow: number | undefined;
+	private usedTokens: number | undefined;
 
 	constructor(
 		private readonly child: ChildProcessWithoutNullStreams,
@@ -399,6 +426,7 @@ class AgyProcess implements LiveProcess {
 		this.conversation = structuredClone(conversationForReuse(messages));
 		this.turn = turn;
 		this.turn.setContextWindow(this.contextWindow);
+		this.turn.setUsedTokens(this.usedTokens);
 		this.setSignal(signal);
 		if (this.stopping) return;
 		for (const call of admitted) {
@@ -441,7 +469,22 @@ class AgyProcess implements LiveProcess {
 	}
 
 	cancelCall(call: PendingToolCall): void {
-		if (this.activePermission?.acpToolCallId === call.id) this.activePermission = null;
+		if (this.stopping || this.closed || this.pendingError) return;
+		if (this.turn.finished && this.admitted.some((admitted) => admitted.id === call.id)) {
+			this.retireAdmittedWait();
+			return;
+		}
+		if (this.activePermission?.acpToolCallId === call.id) {
+			this.activePermission = null;
+			this.grantNextPermission();
+		}
+	}
+
+	private retireAdmittedWait(): void {
+		if (this.stopping || this.closed || this.pendingError) return;
+		this.admitted = [];
+		this.toolCallIds = [];
+		this.kill();
 	}
 
 	private readonly abort = () => {
@@ -604,6 +647,33 @@ class AgyProcess implements LiveProcess {
 			if (size !== undefined && Number.isSafeInteger(size) && size > 0) {
 				this.contextWindow = size;
 				this.turn.setContextWindow(size);
+			}
+			const used = typeof update.used === "number" ? update.used : undefined;
+			if (used !== undefined && Number.isSafeInteger(used) && used > 0) {
+				this.usedTokens = used;
+				this.turn.setUsedTokens(used);
+			}
+			return;
+		}
+		if (kind === "tool_call_update") {
+			const status = typeof update.status === "string" ? update.status : "";
+			const toolCallId = typeof update.toolCallId === "string" ? update.toolCallId : "";
+			if (
+				toolCallId
+				&& this.turn.finished
+				&& (status === "failed" || status === "cancelled")
+				&& this.admitted.some((admitted) => admitted.id === toolCallId)
+			) {
+				this.retireAdmittedWait();
+				return;
+			}
+			if (
+				toolCallId
+				&& this.activePermission?.acpToolCallId === toolCallId
+				&& (status === "failed" || status === "cancelled" || status === "completed")
+			) {
+				this.activePermission = null;
+				this.grantNextPermission();
 			}
 			return;
 		}

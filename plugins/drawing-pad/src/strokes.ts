@@ -24,7 +24,35 @@ function segmentDistanceSquared(a: Point, b: Point, c: Point, d: Point): number 
   return Math.min(pointSegmentDistanceSquared(a, c, d), pointSegmentDistanceSquared(b, c, d),
     pointSegmentDistanceSquared(c, a, b), pointSegmentDistanceSquared(d, a, b));
 }
-function touchesStroke(stroke: Stroke, eraser: Stroke): boolean {
+interface StrokeBounds { minX: number; minY: number; maxX: number; maxY: number; maxHalfWidth: number; len: number }
+const strokeBoundsCache = new WeakMap<Stroke, StrokeBounds>();
+
+function strokeBounds(stroke: Stroke): StrokeBounds {
+  const len = stroke.points.length;
+  const cached = strokeBoundsCache.get(stroke);
+  if (cached && cached.len === len) return cached;
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity, maxHalfWidth = 0;
+  for (let i = 0; i < len; i++) {
+    const a = stroke.points[Math.max(0, i - 1)]!, b = stroke.points[i]!;
+    if (b.x < minX) minX = b.x;
+    if (b.x > maxX) maxX = b.x;
+    if (b.y < minY) minY = b.y;
+    if (b.y > maxY) maxY = b.y;
+    const hw = strokeWidth(a, b) / 2;
+    if (hw > maxHalfWidth) maxHalfWidth = hw;
+  }
+  const bounds: StrokeBounds = { minX, minY, maxX, maxY, maxHalfWidth, len };
+  strokeBoundsCache.set(stroke, bounds);
+  return bounds;
+}
+
+export function touchesStroke(stroke: Stroke, eraser: Stroke): boolean {
+  if (!stroke.points.length || !eraser.points.length) return false;
+  const sb = strokeBounds(stroke), eb = strokeBounds(eraser);
+  const pad = 12 + sb.maxHalfWidth;
+  if (sb.maxX + pad < eb.minX || sb.minX - pad > eb.maxX || sb.maxY + pad < eb.minY || sb.minY - pad > eb.maxY) {
+    return false;
+  }
   for (let i = 0; i < stroke.points.length; i++) {
     const a = stroke.points[Math.max(0, i - 1)]!, b = stroke.points[i]!;
     const radius = 12 + strokeWidth(a, b) / 2;
@@ -49,12 +77,14 @@ export function inkSignature(history: readonly Stroke[], color: string): string 
   const visible = visibleStrokes(history);
   return visible.length ? JSON.stringify([color, visible.map(stroke => stroke.points)]) : "";
 }
-export function paintSegment(context: CanvasRenderingContext2D, a: Point, b: Point, color: string): void {
+function applyInkStyle(context: CanvasRenderingContext2D, color: string): void {
   context.globalCompositeOperation = "source-over";
   context.strokeStyle = color;
   context.fillStyle = color;
   context.lineCap = "round";
   context.lineJoin = "round";
+}
+function drawSegment(context: CanvasRenderingContext2D, a: Point, b: Point): void {
   context.lineWidth = strokeWidth(a, b);
   context.beginPath();
   if (a.x === b.x && a.y === b.y) {
@@ -64,6 +94,10 @@ export function paintSegment(context: CanvasRenderingContext2D, a: Point, b: Poi
     context.moveTo(a.x, a.y); context.lineTo(b.x, b.y); context.stroke();
   }
 }
+export function paintSegment(context: CanvasRenderingContext2D, a: Point, b: Point, color: string): void {
+  applyInkStyle(context, color);
+  drawSegment(context, a, b);
+}
 export function paintInk(canvas: HTMLCanvasElement, width: number, height: number, strokes: readonly Stroke[], color: string,
   origin: { x: number; y: number } = { x: 0, y: 0 }): void {
   const context = canvas.getContext("2d", { willReadFrequently: true });
@@ -71,7 +105,9 @@ export function paintInk(canvas: HTMLCanvasElement, width: number, height: numbe
   context.resetTransform();
   context.clearRect(0, 0, canvas.width, canvas.height);
   context.setTransform(canvas.width / width, 0, 0, canvas.height / height, origin.x * canvas.width / width, origin.y * canvas.height / height);
+  applyInkStyle(context, color);
   for (const stroke of visibleStrokes(strokes)) {
-    stroke.points.forEach((point, i) => paintSegment(context, stroke.points[Math.max(0, i - 1)]!, point, color));
+    const pts = stroke.points;
+    for (let i = 0; i < pts.length; i++) drawSegment(context, pts[Math.max(0, i - 1)]!, pts[i]!);
   }
 }

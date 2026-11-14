@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import { randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import * as http from "node:http";
 import type { AddressInfo } from "node:net";
@@ -19,6 +20,7 @@ export const BRIDGE_SERVER_NAME = "learnharness";
 const MCP_TOOL_PREFIX = `mcp_${BRIDGE_SERVER_NAME}_`;
 const LOOPBACK_HOST = "127.0.0.1";
 const TOKEN_BYTES = 32;
+const activeResponse = new AsyncLocalStorage<http.ServerResponse>();
 
 export type PendingToolCall = { id: string; name: string; arguments: JsonObject };
 
@@ -82,7 +84,12 @@ class ToolCallQueue {
 	private readonly results = new Map<PendingToolCall, (result: CallToolResult) => void>();
 	private waiters: ToolCallWaiter[] = [];
 
-	add(call: PendingToolCall, signal: AbortSignal, onCancel?: (call: PendingToolCall) => void): Promise<CallToolResult> {
+	add(
+		call: PendingToolCall,
+		signal: AbortSignal,
+		onCancel?: (call: PendingToolCall) => void,
+		response?: http.ServerResponse,
+	): Promise<CallToolResult> {
 		const result = new Promise<CallToolResult>((resolve) => {
 			const cancel = () => {
 				const settle = this.results.get(call);
@@ -90,13 +97,18 @@ class ToolCallQueue {
 				settle({ content: [{ type: "text", text: "MCP request cancelled" }], isError: true });
 				onCancel?.(call);
 			};
+			const onResponseClose = () => {
+				if (!response?.writableFinished) cancel();
+			};
 			this.results.set(call, (value) => {
 				this.results.delete(call);
 				signal.removeEventListener("abort", cancel);
+				response?.removeListener("close", onResponseClose);
 				resolve(value);
 			});
 			signal.addEventListener("abort", cancel, { once: true });
-			if (signal.aborted) cancel();
+			response?.once("close", onResponseClose);
+			if (signal.aborted || (response && !response.writableFinished && (response.destroyed || response.closed))) cancel();
 		});
 
 		this.wakeWaiters();
@@ -158,7 +170,12 @@ function createMcpServer(tools: Tool[], queue: ToolCallQueue, callbacks?: Bridge
 			throw error;
 		}
 		seenIds.add(id);
-		const result = queue.add({ id, name: request.params.name, arguments: args }, extra.signal, callbacks?.onCancel);
+		const result = queue.add(
+			{ id, name: request.params.name, arguments: args },
+			extra.signal,
+			callbacks?.onCancel,
+			activeResponse.getStore(),
+		);
 		callbacks?.onCall();
 		return result;
 	});
@@ -182,12 +199,14 @@ function createHttpServer(transport: StreamableHTTPServerTransport, authorizatio
 			return;
 		}
 
-		transport.handleRequest(req, res).catch((error: unknown) => {
-			console.error("agy tool bridge request failed", error);
+		activeResponse.run(res, () =>
+			transport.handleRequest(req, res).catch((error: unknown) => {
+				console.error("agy tool bridge request failed", error);
 
-			if (!res.headersSent) res.writeHead(500);
-			res.end();
-		});
+				if (!res.headersSent) res.writeHead(500);
+				res.end();
+			}),
+		);
 	});
 }
 
@@ -228,6 +247,8 @@ export async function createToolBridge(tools: Tool[], callbacks?: BridgeCallback
 	await mcpServer.connect(transport);
 
 	const httpServer = createHttpServer(transport, authorization);
+	httpServer.keepAliveTimeout = 0;
+	httpServer.requestTimeout = 0;
 	let port: number;
 	try {
 		({ port } = await listen(httpServer));
