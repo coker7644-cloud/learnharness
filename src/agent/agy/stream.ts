@@ -196,7 +196,7 @@ class AgyTurn {
 		if (this.finished) return;
 		this.start();
 		this.closeOpenBlock();
-		this.applyUsedFallback();
+		this.applyUsedTokens();
 		for (const call of calls) {
 			const contentIndex = this.output.content.length;
 			this.output.content.push(call);
@@ -213,7 +213,12 @@ class AgyTurn {
 		if (this.finished) return;
 		this.start();
 		this.closeOpenBlock();
-		if (usage) {
+		// ACP usage_update.used tracks current context window occupancy across
+		// internal CLI tool loops, whereas session/prompt result.usage aggregates
+		// cumulative input/cacheRead/output across every internal request in the turn.
+		if (this.usedTokens !== undefined && this.usedTokens > 0) {
+			this.applyUsedTokens();
+		} else if (usage) {
 			const input = nonNegInt(usage.inputTokens);
 			const output = nonNegInt(usage.outputTokens);
 			const cacheRead = nonNegInt(usage.cachedReadTokens);
@@ -229,11 +234,7 @@ class AgyTurn {
 					reasoning,
 					totalTokens,
 				});
-			} else {
-				this.applyUsedFallback();
 			}
-		} else {
-			this.applyUsedFallback();
 		}
 
 		if (stopReason === "cancelled") {
@@ -279,7 +280,7 @@ class AgyTurn {
 		this.stream.push({ type: "start", partial: this.output });
 	}
 
-	private applyUsedFallback(): void {
+	private applyUsedTokens(): void {
 		if (this.usedTokens === undefined || this.usedTokens <= 0) return;
 		Object.assign(this.output.usage, {
 			input: this.usedTokens,

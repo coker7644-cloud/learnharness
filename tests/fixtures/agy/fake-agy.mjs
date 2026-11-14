@@ -189,6 +189,9 @@ async function handlePrompt(rpcId) {
 			results.push({ id: step.id, text });
 		}
 	}
+	if (scenario.afterUsed) {
+		sendUpdate({ sessionUpdate: "usage_update", used: scenario.afterUsed });
+	}
 	if (scenario.afterText) {
 		const suffix = results.map((r) => `${r.id}:${r.text ?? r.outcome}`).join(" | ");
 		sendUpdate({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: `${scenario.afterText} ${suffix}` } });

@@ -32,6 +32,7 @@ const { LIVE_PROCESS_IDLE_TIMEOUT_MS, liveProcessIdleTimeoutMs } = await import(
 const { AGY_MODELS } = await import("../src/agent/agy/provider.ts");
 const { createAgyStreamFunction } = await import("../src/agent/agy/stream.ts");
 const { createTeacherAgent } = await import("../src/agent/teacher-agent.ts");
+const { calculateContextTokens } = await import("../src/core/compaction.ts");
 const { measuredContextTokens } = await import("../src/core/context-usage.ts");
 const { cliContextWindowOf, danglingQuestionOf } = await import("../src/core/native-messages.ts");
 const { handleChatRequest } = await import("../src/server/chat-handler.ts");
@@ -49,6 +50,14 @@ const ANSWER_TEXT = "SYN, SYN-ACK, ACK";
 type FakeScenario = {
 	window?: number;
 	used?: number;
+	afterUsed?: number;
+	usage?: {
+		inputTokens?: number;
+		outputTokens?: number;
+		cachedReadTokens?: number;
+		cachedWriteTokens?: number;
+		thoughtTokens?: number;
+	};
 	checkpointWait?: boolean;
 	thought?: string;
 	text?: string;
@@ -419,4 +428,82 @@ test("moving on while the held MCP call is still open still fails continuation",
 	assert.equal(last.stopReason, "error");
 	assert.match(last.errorMessage ?? "", /moved on while harness tool calls were waiting for results/);
 });
+
+test("stop turns prefer usage_update.used over cumulative result.usage across toolUse continuation and chat turns", async (t) => {
+	const cumulativeUsage = {
+		inputTokens: 150_126,
+		outputTokens: 40_792,
+		cachedReadTokens: 1_144_366,
+		cachedWriteTokens: 0,
+		thoughtTokens: 34_336,
+	};
+	const fakeRun = createFakeRun(t, [
+		{
+			window: 1_048_576,
+			used: 118_500,
+			calls: [{ kind: "mcp", id: "call_pdf_usage", tool: "pdf_info", arguments: {} }],
+			afterUsed: 132_250,
+			afterText: "Brief ready:",
+			usage: cumulativeUsage,
+		},
+		{
+			window: 1_048_576,
+			used: 132_250,
+			text: "Single-turn reply",
+			usage: cumulativeUsage,
+		},
+	]);
+
+	const model = AGY_MODELS.find((candidate) => candidate.id === "gemini-4-hydrogen");
+	assert.ok(model);
+	const wrappedStream = workerRequestStream(createAgyStreamFunction(fakeRun.runAgy));
+	const tools = [{ name: "pdf_info", description: "triage", parameters: { type: "object", properties: {} } as never }];
+	const sessionId = "worker-usage-preference-session";
+
+	const firstMessages = [{ role: "user" as const, content: "Read PDF", timestamp: Date.now() }];
+	const firstRes = await wrappedStream(model, normalizeContext({ systemPrompt: "PDF reader", messages: firstMessages, tools }), { sessionId }).result();
+	assert.equal(firstRes.stopReason, "toolUse");
+	assert.equal(firstRes.usage.totalTokens, 118_500);
+	assert.equal(calculateContextTokens(firstRes.usage), 118_500);
+
+	const nextMessages = [
+		...firstMessages,
+		firstRes,
+		{ role: "toolResult" as const, toolCallId: "call_pdf_usage", toolName: "pdf_info", content: [{ type: "text" as const, text: "Pages: 14" }], isError: false, timestamp: Date.now() },
+	];
+	const secondRes = await wrappedStream(model, normalizeContext({ systemPrompt: "PDF reader", messages: nextMessages, tools }), { sessionId }).result();
+	assert.equal(secondRes.stopReason, "stop");
+	assert.equal(secondRes.usage.totalTokens, 132_250);
+	assert.equal(calculateContextTokens(secondRes.usage), 132_250);
+	assert.equal(measuredContextTokens([{ ...firstRes, id: "m1" }, { ...secondRes, id: "m2" }]), 132_250);
+	await waitForExit(fakeRun.children[0]!);
+
+	const chatId = createAgyChat(t);
+	await runChatTurn(chatId, { type: "text", text: "summarize" }, createAgentFactory(fakeRun));
+	const chatMessages = chatStore.getChat(chatId)?.messages ?? [];
+	const lastAssistant = chatMessages.findLast((m) => m.role === "assistant");
+	assert.ok(lastAssistant?.role === "assistant");
+	assert.equal(measuredContextTokens(chatMessages), 132_250);
+	assert.equal(calculateContextTokens(lastAssistant.usage), 132_250);
+	await waitForExit(fakeRun.children[1]!);
+});
+
+test("stop turns fall back to result.usage when no usage_update.used was emitted", async (t) => {
+	const fakeRun = createFakeRun(t, [
+		{
+			window: 1_048_576,
+			text: "No usage_update emitted",
+			usage: { inputTokens: 120, outputTokens: 30, cachedReadTokens: 10, cachedWriteTokens: 0 },
+		},
+	]);
+	const chatId = createAgyChat(t);
+	await runChatTurn(chatId, { type: "text", text: "hello" }, createAgentFactory(fakeRun));
+	const chatMessages = chatStore.getChat(chatId)?.messages ?? [];
+	const lastAssistant = chatMessages.findLast((m) => m.role === "assistant");
+	assert.ok(lastAssistant?.role === "assistant");
+	assert.equal(measuredContextTokens(chatMessages), 160);
+	assert.equal(calculateContextTokens(lastAssistant.usage), 160);
+	await waitForExit(fakeRun.children[0]!);
+});
+
 
