@@ -2,7 +2,7 @@ import * as fs from "node:fs";
 import { createRequire } from "node:module";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
-import { standardFontsDir } from "./pdf-ops";
+import { pdfResourceOptions } from "./pdf-ops";
 import { svgImageSource } from "../../../lib/svg-image-source";
 
 /**
@@ -581,7 +581,7 @@ async function renderPdfPages(
 	// Standard-font data as a directory path (live-smoke finding 2026-09-19:
 	// without it pdfjs renders non-embedded standard fonts via fallback);
 	// verbosity 0 = errors only (JBIG2 noise on scanned PDFs).
-	const loadingTask = pdfjs.getDocument({ data, standardFontDataUrl: standardFontsDir(), verbosity: 0 });
+	const loadingTask = pdfjs.getDocument({ data, ...pdfResourceOptions(), verbosity: 0 });
 	const doc = await loadingTask.promise;
 	try {
 		const out: RenderedPdfPage[] = [];

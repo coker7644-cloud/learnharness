@@ -55,6 +55,17 @@ export function standardFontsDir(): string {
 	return path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "..", "..", "node_modules", "pdfjs-dist", "standard_fonts") + "/";
 }
 
+/** Resources required by CJK maps and JBIG2-backed Type3 glyphs. */
+export function pdfResourceOptions() {
+    const root = path.dirname(standardFontsDir().slice(0, -1));
+    return {
+        standardFontDataUrl: standardFontsDir(),
+        cMapUrl: path.join(root, "cmaps") + "/",
+        cMapPacked: true,
+        wasmUrl: path.join(root, "wasm") + "/",
+    };
+}
+
 async function openDocument(filePath: string) {
 	return openBytes(new Uint8Array(await fs.readFile(filePath)));
 }
@@ -70,7 +81,7 @@ async function loadBytes(data: Uint8Array, signal?: AbortSignal): Promise<PdfLoa
 	// workerSrc needed); teardown is the loading task's destroy().
 	// verbosity 0 = errors only — scanned PDFs (JBIG2 XObjects) otherwise
 	// flood the log with per-page warnings (live-smoke finding 2026-09-19).
-	return pdfjs.getDocument({ data, standardFontDataUrl: standardFontsDir(), verbosity: 0 });
+	return pdfjs.getDocument({ data, ...pdfResourceOptions(), verbosity: 0 });
 }
 
 async function openBytes(data: Uint8Array, signal?: AbortSignal, loadTask: PdfTaskLoader = loadBytes) {
